@@ -76,6 +76,10 @@ use lazy_global::lazy_global;
 ///
 /// Handles SteamStub 3.1 possibly being applied on top of Arxan.
 ///
+/// When called before the program entry point and Arxan has hooked the MSVC CRT entry sequence,
+/// Dearxan patches those Arxan entry stubs before invoking `__security_init_cookie`, preventing
+/// their checks from running.
+///
 /// # Safety
 ///
 /// This function applies code patches derived from imperfect binary analysis to the program.
@@ -169,6 +173,18 @@ where
     }
 
     unsafe {
+        schedule_before_arxan_entry(|is_present, is_executing_entrypoint: bool| {
+            if !is_present {
+                return;
+            }
+
+            NEEDS_SUSPEND.store(!is_executing_entrypoint, Ordering::SeqCst);
+            log::debug!("pre-patching Arxan entry point stubs");
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = ffi::DearxanResult::from_global(&DEARXAN_NEUTER_ARXAN_RESULT);
+            }));
+        });
+
         schedule_after_arxan(move |is_present, is_executing_entrypoint: bool| {
             NEEDS_SUSPEND.store(!is_executing_entrypoint, Ordering::SeqCst);
             let result = if is_present {
@@ -190,6 +206,22 @@ where
             }));
         })
     };
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CallbackTiming {
+    /// Run before the CRT `__security_init_cookie` call when Arxan entry stubs are present.
+    BeforeArxanEntry,
+    /// Run after the CRT `__security_init_cookie` call, preserving `schedule_after_arxan`
+    /// semantics.
+    AfterArxanEntry,
+}
+
+unsafe fn schedule_before_arxan_entry<F>(callback: F)
+where
+    F: FnOnce(bool, bool) + Send + 'static,
+{
+    unsafe { schedule_arxan_callback(callback, CallbackTiming::BeforeArxanEntry) }
 }
 
 /// Schedule a callback to run right after the Arxan entry point stub terminates, in lockstep with
@@ -216,8 +248,25 @@ pub unsafe fn schedule_after_arxan<F>(callback: F)
 where
     F: FnOnce(bool, bool) + Send + 'static,
 {
+    unsafe { schedule_arxan_callback(callback, CallbackTiming::AfterArxanEntry) }
+}
+
+unsafe fn schedule_arxan_callback<F>(callback: F, timing: CallbackTiming)
+where
+    F: FnOnce(bool, bool) + Send + 'static,
+{
     #[repr(C)]
     struct Ctx {
+        callbacks: SList<unsafe extern "C" fn(bool, bool)>,
+        wait_done: AtomicU32,
+        is_present: AtomicBool,
+        // Appended for ABI compatibility with older shared mappings: older code only knows about
+        // the fields above, so new code must check the mapped size before using this list.
+        before_entry_callbacks: SList<unsafe extern "C" fn(bool, bool)>,
+    }
+
+    #[repr(C)]
+    struct CtxV1 {
         callbacks: SList<unsafe extern "C" fn(bool, bool)>,
         wait_done: AtomicU32,
         is_present: AtomicBool,
@@ -229,24 +278,53 @@ where
             Ctx {
                 callbacks: SList::new(),
                 wait_done: AtomicU32::new(0),
-                is_present: AtomicBool::new(false)
+                is_present: AtomicBool::new(false),
+                before_entry_callbacks: SList::new(),
             }
         };
     }
     static CALLBACK_PUSHED: Once = Once::new();
 
-    fn first_callback_flush(is_present: bool, is_blocking: bool) {
+    fn post_entry_callbacks_supported() -> bool {
+        DEARXAN_SCHEDULED_AFTER_ARXAN.1 >= size_of::<CtxV1>()
+    }
+
+    fn before_entry_callbacks_supported() -> bool {
+        DEARXAN_SCHEDULED_AFTER_ARXAN.1 >= size_of::<Ctx>()
+    }
+
+    fn flush_callbacks(
+        callbacks: &SList<unsafe extern "C" fn(bool, bool)>,
+        is_present: bool,
+        is_blocking: bool,
+    ) {
+        for callback in callbacks.flush() {
+            unsafe { callback(is_present, is_blocking) };
+        }
+    }
+
+    fn flush_before_entry_callbacks(is_present: bool, is_blocking: bool) {
+        if !before_entry_callbacks_supported() {
+            return;
+        }
+
+        let ctx = unsafe { &*DEARXAN_SCHEDULED_AFTER_ARXAN.0 };
+        flush_callbacks(&ctx.before_entry_callbacks, is_present, is_blocking);
+    }
+
+    fn finish_after_entry_callbacks(is_present: bool, is_blocking: bool) {
         let ctx = unsafe { &*DEARXAN_SCHEDULED_AFTER_ARXAN.0 };
 
         ctx.is_present.store(false, Ordering::SeqCst);
-
-        let callbacks = ctx.callbacks.flush();
-        for callback in callbacks {
-            unsafe { callback(is_present, is_blocking) };
-        }
+        flush_callbacks(&ctx.callbacks, is_present, is_blocking);
 
         ctx.wait_done.store(1, Ordering::SeqCst);
         atomic_wait::wake_all(&ctx.wait_done);
+    }
+
+    fn finish_all_callbacks(is_present: bool, is_blocking: bool) {
+        flush_before_entry_callbacks(is_present, is_blocking);
+        finish_after_entry_callbacks(is_present, is_blocking);
     }
 
     unsafe fn schedule_after_arxan_inner() {
@@ -268,7 +346,7 @@ where
                     std::thread::spawn(move || {
                         // Avoid potential race condition where callback is pushed after the flush
                         CALLBACK_PUSHED.wait();
-                        first_callback_flush(false, false);
+                        finish_all_callbacks(false, false);
                     });
                     return;
                 };
@@ -285,7 +363,7 @@ where
                         // Note: No CALLBACK_PUSHED race condition here: `blocking_entry_point` is
                         // false, so the same check after pushing the callback will be true and
                         // another flush will be triggered
-                        first_callback_flush(msvc_ep.is_arxan_hooked, false);
+                        finish_all_callbacks(msvc_ep.is_arxan_hooked, false);
                     });
                     return;
                 }
@@ -300,14 +378,19 @@ where
                     move || {
                         log::debug!("removing __security_init_cookie entry point hook");
                         security_init_cookie_hook.unhook();
-                        // TODO: Fully reverse the entry point so this is not necessary
-                        log::debug!(
-                            "calling __security_init_cookie (will run Arxan initialization routines)"
-                        );
+
+                        if msvc_ep.is_arxan_hooked {
+                            log::debug!(
+                                "flushing pre-entry callbacks to patch Arxan entry stubs before they run"
+                            );
+                            flush_before_entry_callbacks(true, true);
+                        }
+
+                        log::debug!("calling __security_init_cookie");
                         security_init_cookie_hook.original()();
                         log::debug!("flushing callback functions");
 
-                        first_callback_flush(msvc_ep.is_arxan_hooked, true);
+                        finish_all_callbacks(msvc_ep.is_arxan_hooked, true);
                     },
                     &game().hook_buffer,
                 );
@@ -318,15 +401,32 @@ where
         }
     }
 
-    // Only use callbacks here, as older versions of DEARXAN_SCHEDULED_AFTER_ARXAN may not have the
-    // is_present and wait_done fields
+    // The original shared mapping contained the after-entry callback list followed by wait_done and
+    // is_present. The pre-entry callback list was appended later, so check the mapped size before
+    // using it.
     let ctx = unsafe { &*DEARXAN_SCHEDULED_AFTER_ARXAN.0 };
-    let bare_callback = BareFnOnce::new_c(callback);
-    ctx.callbacks.push(bare_callback.leak());
-    CALLBACK_PUSHED.call_once(|| {});
+    let bare_callback = BareFnOnce::new_c(callback).leak();
+    match timing {
+        CallbackTiming::AfterArxanEntry => ctx.callbacks.push(bare_callback),
+        CallbackTiming::BeforeArxanEntry if before_entry_callbacks_supported() => {
+            ctx.before_entry_callbacks.push(bare_callback);
+        }
+        CallbackTiming::BeforeArxanEntry => {
+            log::warn!(
+                "module that initialized the schedule_after_arxan state does not support pre-entry callbacks"
+            );
+            log::warn!(
+                "Arxan entry point stubs will run before neutering falls back to completion"
+            );
+            ctx.callbacks.push(bare_callback);
+        }
+    }
+    if matches!(timing, CallbackTiming::AfterArxanEntry) {
+        CALLBACK_PUSHED.call_once(|| {});
+    }
 
     if !is_pre_entry_point() {
-        if DEARXAN_SCHEDULED_AFTER_ARXAN.1 < size_of::<Ctx>() {
+        if !post_entry_callbacks_supported() {
             log::error!(
                 "module that initialized the schedule_after_arxan state does not support post-entry-point calls"
             );
@@ -344,10 +444,8 @@ where
             log::debug!("flushing callback functions");
 
             let is_present = ctx.is_present.load(Ordering::SeqCst);
-            let callbacks = ctx.callbacks.flush();
-            for callback in callbacks {
-                unsafe { callback(is_present, false) };
-            }
+            flush_before_entry_callbacks(is_present, false);
+            flush_callbacks(&ctx.callbacks, is_present, false);
         });
     }
 }

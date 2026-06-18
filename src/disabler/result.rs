@@ -10,8 +10,8 @@ pub struct Status {
     /// If true, the callback execution is blocking the program entry point. If false, the callback
     /// is being executed in a separate thread.
     ///
-    /// In either case, it is guaranteed that the Arxan entry point stub has finished initializing
-    /// once the callback runs.
+    /// In either case, by the time the callback runs, Dearxan has either patched the Arxan entry
+    /// stubs before they could run or synchronized after they already ran.
     pub is_executing_entrypoint: bool,
 }
 

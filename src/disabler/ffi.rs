@@ -44,9 +44,9 @@ pub type DearxanUserCallback = extern "C" fn(result: *const DearxanResult, conte
 
 /// Single function to neuter all of Arxan's checks.
 ///
-/// The callback will be invoked with the true entry point of the program once patching
-/// is complete, and a bool indicating whether Arxan was detected. It can be used to initialize
-/// hooks/etc.
+/// The callback will be invoked once patching is complete, with fields indicating whether Arxan
+/// was detected and whether execution is currently blocking the program entry point. It can be used
+/// to initialize hooks/etc. before the game continues.
 ///
 /// Handles SteamStub 3.1 possibly being applied on top of Arxan.
 ///

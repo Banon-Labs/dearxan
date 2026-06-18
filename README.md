@@ -4,7 +4,7 @@
 
 It is currently able to fully[^1] neuter Arxan in all the FromSoftware games using it. In particular, once patches are applied absolutely zero Arxan code (e.g. anti-debug checks and integrity checks) will run and all encrypted functions will be forever decrypted.
 
-[^1]: This is not quite true at the moment, since we still have to let the Arxan entry point stubs run. This is not really a problem as the entry point stub does not do any anti-debug checks. In some games (e.g. Dark Souls Remastered) these stubs perform integrity checks and crash the game if modifications are detected, which can be mitigated by performing your hooks in the callback function provided to `neuter_arxan`. Once the entry point stubs are fully reverse engineered, this will no longer be necessary.
+[^1]: When called before the program entry point, `dearxan` patches Arxan's entry point stubs before the CRT `__security_init_cookie` call reaches them, so their checks are skipped too. If `dearxan` is loaded after the process entry point has already started, any entry stubs that already ran cannot be undone.
 
 Note that this crate is only tested against the variants of Arxan present in the latest versions FromSoftware games, which is all of the following:
 - Dark Souls Remastered
@@ -107,7 +107,7 @@ Download the static library from the [Releases](https://github.com/tremwil/dearx
 
 If you want to patch an executable on disk, for example, you will need to write your own disabler. This will involve analyzing the Arxan stubs in the binary with `dearxan::analysis::analyze_all_stubs` or equivalent APIs, then passing the resulting `StubInfo` values to `dearxan::patch::ArxanPatch::build_from_stubs`. From there you will have to iterate over the patches and apply them to the executable manually.
 
-Note that currently, for this to work on a live executable image it is important to make sure that the Arxan entry point stub has been invoked. For FromSoftware games, beware that binaries may be wrapped in SteamStub as well. 
+When writing a live patcher yourself, patch Arxan's entry point stubs before letting the CRT `__security_init_cookie` call reach them; if you attach after the process entry point has already started, any entry stubs that already ran cannot be undone. For FromSoftware games, beware that binaries may be wrapped in SteamStub as well.
 
 # About Arxan
 
