@@ -14,7 +14,7 @@ use std::path::PathBuf;
 
 use dearxan::analysis::{StubAnalyzer, analyze_all_stubs_with};
 use dearxan_test_utils::{FsExe, init_log};
-use pelite::pe64::{Pe, PeObject};
+use pelite::pe64::Pe;
 
 fn main() {
     init_log(log::LevelFilter::Error);
@@ -38,7 +38,12 @@ fn main() {
     let stub_infos = analyze_all_stubs_with(pe, StubAnalyzer::new());
 
     let mut regions = 0usize;
-    let mut covering = 0usize;
+    // Coverage is tracked PER TARGET. A single shared counter is wrong: with several VAs and only
+    // one of them covered, every target would report the covered verdict. That bug shipped in the
+    // first version of this file and was caught in review. It did not corrupt the DS2 numbers,
+    // because none of the three VAs tested were covered and the counter stayed at zero for all of
+    // them -- but "the bug did not fire this time" is not the same as "the tool is right".
+    let mut covering = vec![0usize; targets.len()];
     let mut min_va = u64::MAX;
     let mut max_va = 0u64;
     for si in stub_infos.iter().filter_map(|si| si.as_ref().ok()) {
@@ -49,9 +54,9 @@ fn main() {
             regions += 1;
             min_va = min_va.min(start);
             max_va = max_va.max(end);
-            for t in &targets {
+            for (i, t) in targets.iter().enumerate() {
                 if (start..end).contains(t) {
-                    covering += 1;
+                    covering[i] += 1;
                     println!(
                         "COVERED {t:#x} by region {start:#x}..{end:#x} ({} bytes), stub test_rsp={:#x}",
                         r.size, si.test_rsp_va
@@ -61,7 +66,12 @@ fn main() {
         }
     }
     println!("regions_examined={regions} span={min_va:#x}..{max_va:#x}");
-    for t in &targets {
-        println!("{t:#x}: {}", if covering > 0 { "see COVERED lines above" } else { "NOT covered by any declared encrypted region" });
+    for (i, t) in targets.iter().enumerate() {
+        let n = covering[i];
+        if n > 0 {
+            println!("{t:#x}: COVERED by {n} declared encrypted region(s) -- see above");
+        } else {
+            println!("{t:#x}: NOT covered by any declared encrypted region");
+        }
     }
 }
